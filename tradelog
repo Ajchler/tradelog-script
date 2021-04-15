@@ -1,0 +1,192 @@
+#!/bin/sh
+
+# file: tradelog
+# author: Vojtech Eichler (xeichl01)
+# date: 2nd of April 2021
+# description: script to process trade logs, for more information and usage check help
+
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+
+DATETIME_BEFORE="9999-99-99 99:99:99"
+DATETIME_AFTER="0000-00-00 00:00:00"
+COMMAND=""
+TICKERS=""
+WIDTH=""
+GZIP_LOGS=""
+STD_LOGS=""
+ALL_LOGS=""
+FILTERED_LOGS=""
+RESULT=""
+MAX=""
+
+help() {
+	echo ""
+	echo "Usage: tradelog [-h|--help] [FILTER] [COMMAND] [LOG [LOG2 [...]]"; echo ""
+	echo "COMMAND:"
+	echo "	list-tick – prints list of tickers"
+	echo "	profit – prints profit"
+	echo "	pos – prints all held positions sorted by value"
+	echo "	last-price – prints list of tickers with last known price"
+	echo "	hist-ord – prints histogram of tickers"
+	echo "	graph-pos – prints graph of all held positions"; echo ""
+	echo "FILTER:"
+	echo "	-a DATETIME – after: all records AFTER datetime given"
+	echo "	-b DATETIME – before: all records BEFORE datetime given"
+	echo "		-DATETIME is expected to be in format: YYYY-MM-DD HH:MM:SS"
+	echo "	-t TICKER – only working with records with this ticker"
+	echo "		if more tickers are given, works with all of them"
+	echo "	-w WIDTH – sets the maximum width in graph"; echo ""
+	exit 0
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+		-h|--help)
+			help
+			;;
+		-a)
+			DATETIME_AFTER=$2
+			shift
+			shift
+			;;
+		-b)
+			DATETIME_BEFORE=$2
+			shift
+			shift
+			;;
+		-t)
+			TICKERS="$2|$TICKERS"
+			shift
+			shift
+			;;
+		-w)
+			if [ "$WIDTH" != "" ]
+			then
+				echo "ERROR: Using parameter WIDTH (-w) more than once"
+				exit 1
+			else
+				WIDTH=$2
+				shift
+				shift
+			fi
+			;;
+		list-tick|profit|pos|last-price|hist-ord|graph-pos)
+			if [ "$COMMAND" != "" ]
+			then
+				echo "ERROR: Using more than one command"
+				exit 1
+			fi
+			COMMAND=$1
+			shift
+			;;
+		*)
+			# sorting .log files and gzipped files
+			if file --mime-type "$1" | grep -q gzip$
+			then
+				GZIP_LOGS="${GZIP_LOGS} $1"
+			else
+				STD_LOGS="${STD_LOGS} $1"
+			fi
+			shift
+			;;
+	esac
+done
+
+# removing "|" from the end of TICKERS 
+TICKERS=${TICKERS%?}
+
+# combining logs into one variable, taking care of gzip files
+if [ "$GZIP_LOGS" = "" ]
+then
+	ALL_LOGS=$(cat $STD_LOGS | sort)
+else
+	ALL_LOGS=$(gunzip -d -c $GZIP_LOGS | cat $STD_LOGS - | sort)
+fi
+
+# filtering data by DATETIME and TICKER
+FILTERED_LOGS=$(echo "$ALL_LOGS" | awk -F ';' -v after="$DATETIME_AFTER" -v before="$DATETIME_BEFORE" '{if (($1 > after) && ($1 < before)) { print } }')
+
+# filter if tickers were given, splitting TICKERS with | as delimeter, then cycling through all tickers to check if log is valid according to selection
+if [ "$TICKERS" != "" ]
+then
+	FILTERED_LOGS=$(echo "$FILTERED_LOGS" | awk -F ';' -v count="0" -v ticker="$TICKERS" 'BEGIN{ count  = split(ticker, tickerArr, "|")} { for(i = 1; i <= count; i++) { if($2 == tickerArr[i]) { print } } }')
+fi
+
+case $COMMAND in
+	list-tick)
+		# takes tickers from filtered logs, sorts them and removes duplicates
+		RESULT=$(echo "$FILTERED_LOGS" | awk -F ';' '{ print $2 }' | sort - | uniq)
+		echo "$RESULT"
+		;;
+	profit)
+		RESULT=$(echo "$FILTERED_LOGS" | awk -F ';' -v sum="0" '{ if ($3 == "sell")  { sum+=$4*$6 } else { sum-=$4*$6 } } END {printf "%.2f",sum}')
+		echo "$RESULT"
+		;;
+	pos)
+		# sorting by ticker
+		RESULT=$(echo "$FILTERED_LOGS" | sort -s -t ';' -k 2,2)
+		# counting value
+		RESULT=$(echo "$RESULT" |awk -F ';' -v sum="0" -v price="0" -v ticker="" '{if (ticker=="") {ticker=$2} if ($2==ticker) { if ($3 == "sell")  { sum-=$6 } else { sum+=$6 } price=$4 } else { printf "%s:%.2f\n",ticker,sum*price; ticker=$2; if ($3 == "sell")  { sum=-$6 } else { sum=$6 }; price=$4 } } END { printf "%s:%.2f\n",ticker,sum*price }')
+		# sorting by value
+		RESULT=$(echo "$RESULT" | sort -t ':' -k 2,2 -g -r )
+		# finding longest value for padding
+		MAX=$(echo "$RESULT" | awk -F ':' -v max="0" '{ if (length($2) > max) {max=length($2)} } END { printf "%.2f", max }')
+		# padding results according to longest value
+		RESULT=$(echo "$RESULT" | awk -F ':' -v max="$MAX" '{printf "%-10s: %*.2f\n",$1,max,$2}')
+		echo "$RESULT"
+		;;
+	last-price)	
+		# sorting by ticker
+		RESULT=$(echo "$FILTERED_LOGS" | sort -s -t ';' -k 2,2)
+		# finding last price for each ticker, when ticker is changed, print old ticker with last price
+		RESULT=$(echo "$RESULT" | awk -F ';' -v ticker="" -v price="0" ' {if (ticker=="") {ticker=$2} if ($2==ticker) { price=$4 } else { printf "%s:%.2f\n",ticker,price; ticker=$2; price=$4 } } END { printf "%s:%.2f\n",ticker,price }')
+		# finding longest value for padding
+		MAX=$(echo "$RESULT" | awk -F ':' -v max="0" '{ if (length($2) > max) {max=length($2)} } END { printf "%.2f", max }')
+		# padding results
+		RESULT=$(echo "$RESULT" | awk -F ':' -v max="$MAX" '{printf "%-10s: %*.2f\n",$1,max,$2}')
+		echo "$RESULT"
+		;;
+	hist-ord)
+		if [ "$WIDTH" = "" ]
+		then
+			# sorting by ticker, then appends hasttag everytime it reads the same ticker, when new ticker is found, print hashtags
+			RESULT=$(echo "$FILTERED_LOGS" | sort -t ';' -k 2,2 | awk -F ';' -v ticker="" -v to_print="" '{if (ticker=="") {ticker=$2} if ($2==ticker) { to_print=to_print"#" } else { printf "%-10s: %s\n",ticker,to_print; ticker=$2; to_print="#" } } END { printf "%-10s: %s\n",ticker,to_print }')
+		else
+			# finds longest value, so that the relative width of each row can be calculated
+			MAX=$(echo "$FILTERED_LOGS" | sort -t ';' -k 2,2 | awk -F ';' -v ticker="" -v max="0" -v count="0" '{if (ticker=="") {ticker=$2} if ($2==ticker) { count=count+1 } else { if (count > max) { max=count } ; ticker=$2; count=1 } } END { printf "%.2f", max }')
+			# counting number of time ticker is present in the logs, then calculates number of hashtags with math formula (count/max * width)
+			RESULT=$(echo "$FILTERED_LOGS" | sort -t ';' -k 2,2 | awk -F ';' -v ticker="" -v count="0" -v max="$MAX" -v to_print=" " -v width="$WIDTH" '{if (ticker=="") {ticker=$2} if ($2==ticker) { count=count+1 } else { count=(count/max)*width; while (count >= 1) { to_print=to_print"#"; count=count-1 }; printf "%-10s:%s\n",ticker,to_print; ticker=$2; count=1; to_print=" " } } END { count=(count/max)*width; while (count >= 1) { to_print=to_print"#"; count=count-1 }; printf "%-10s:%s\n",ticker,to_print }')	
+		fi
+		echo "$RESULT"
+		;;
+	graph-pos)
+		if [ "$WIDTH" = "" ]
+		then
+			# applying pos without sorting by value, for more commentary, check pos implementation
+			RESULT=$(echo "$FILTERED_LOGS" | sort -s -t ';' -k 2,2)
+			RESULT=$(echo "$RESULT" |awk -F ';' -v sum="0" -v price="0" -v ticker="" '{if (ticker=="") {ticker=$2} if ($2==ticker) { if ($3 == "sell")  { sum-=$6 } else { sum+=$6 } price=$4 } else { printf "%s:%.2f\n",ticker,sum*price; ticker=$2; if ($3 == "sell")  { sum=-$6 } else { sum=$6 }; price=$4 } } END { printf "%s:%.2f\n",ticker,sum*price }')
+			MAX=$(echo "$RESULT" | awk -F ':' -v max="0" '{ if (length($2) > max) {max=length($2)} } END { printf "%.2f", max }')
+			RESULT=$(echo "$RESULT" | awk -F ':' -v max="$MAX" '{printf "%-10s: %*.2f\n",$1,max,$2}')
+
+			# converting pos to graph, where each character in graph represents 1000
+			RESULT=$(echo "$RESULT" | awk -F ':' -v var="0" -v to_print="" '{ to_print=""; printf "%-10s:",$1; if ( $2 > 0 ) { var=$2; while (var >= 1000) { to_print=to_print"#"; var=var-1000 } } else { var=-$2; while (var >= 1000) { to_print=to_print"!"; var=var-1000 } }; if (to_print != "") {printf " %s\n", to_print}}')
+		else
+			# sorting by ticker
+			RESULT=$(echo "$FILTERED_LOGS" | sort -s -t ';' -k 2,2)
+			# counting value for each ticker, similar to pos
+			RESULT=$(echo "$RESULT" |awk -F ';' -v sum="0" -v price="0" -v ticker="" '{if (ticker=="") {ticker=$2} if ($2==ticker) { if ($3 == "sell")  { sum-=$6 } else { sum+=$6 } price=$4 } else { printf "%-10s:%.2f\n",ticker,sum*price; ticker=$2; if ($3 == "sell")  { sum=-$6 } else { sum=$6 }; price=$4 } } END { printf "%-10s:%.2f\n",ticker,sum*price }')
+			# finding longest value
+			MAX=$(echo "$RESULT" | awk -F ':' -v max="0" -v number="0" '{ if ($2 > 0) { number=$2 } else { number=-($2) } if (number > max) {max=number} } END { printf "%.2f",max }')
+			# counting and printing number of characters that represent the graph
+			RESULT=$(echo "$RESULT" | awk -F ':' -v max="$MAX" -v width="$WIDTH" -v count="0" -v to_print="" '{ if ($2 > 0) { count=($2/max)*width; while (count >= 1) { to_print=to_print"#"; count=count-1 }; if ( to_print != "" ) { printf "%-10s: %s\n",$1,to_print } else  { printf "%-10s:\n",$1} to_print="" } else { count=(-$2/max)*width; while (count >= 1) { to_print=to_print"!"; count=count-1 }; if ( to_print != "" ) { printf "%-10s: %s\n",$1, to_print} else  { printf "%-10s:\n",$1} to_print="" } }')
+		fi
+		echo "$RESULT"
+		;;
+	*)
+		echo "$FILTERED_LOGS"
+		;;
+esac
+
+exit 0
+
